@@ -65,6 +65,44 @@ Add torchrun to path if ./run.sh gives error `torchrun: command not found`.
 
 **Note: torch.compile will add around 7 minutes of latency the first time you run the code.**
 
+By default `run.sh` launches the small model (`train_gpt.py`). To run the medium track, set:
+```bash
+TRAIN_SCRIPT=train_gpt_medium.py ./run.sh
+```
+
+### Single GPU / smaller VRAM (e.g. RTX 5090 24GB)
+
+Use a smaller batch profile and single process:
+```bash
+NPROC=1 GPU_PROFILE=5090 ./run.sh
+```
+
+Or use the preset script:
+```bash
+./run_5090.sh
+```
+
+For medium on 5090:
+```bash
+TRAIN_SCRIPT=train_gpt_medium.py NPROC=1 GPU_PROFILE=5090 ./run.sh
+```
+Or use the preset script:
+```bash
+./run_5090_medium.sh
+```
+
+Optional overrides if you still hit OOM:
+```bash
+NPROC=1 GRAD_ACCUM_STEPS=16 VAL_BATCH_SIZE=65536 ./run.sh
+```
+
+If you're not on H100, install a FlashAttention build for your GPU and force it:
+```bash
+pip install flash-attn --no-build-isolation
+ATTN_BACKEND=flash_attn NPROC=1 GPU_PROFILE=5090 ./run.sh
+```
+Note: Flash Attention 3 is H100-only in this repo; non-H100 GPUs use `flash-attn` (v2), so performance will differ.
+
 Official records are timed on 8 NVIDIA H100 GPUs from https://app.primeintellect.ai/. PrimeIntellect has generously sponsored recent validation runs.
 
 ## Alternative: Running with Docker (recommended for precise timing)
@@ -367,4 +405,3 @@ compared to Shampoo.
 ```
 
 <img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
-

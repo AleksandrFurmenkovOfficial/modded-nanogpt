@@ -899,7 +899,7 @@ class Yarn(nn.Module):
         self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
 
 def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
-    assert cos.size(0) >= x_BTHD.size(-3)
+    torch._assert(cos.size(0) >= x_BTHD.size(-3), "rotary: cos buffer too small")
     cos, sin = (
         cos[None, : x_BTHD.size(-3), None, :],
         sin[None, : x_BTHD.size(-3), None, :],
@@ -920,7 +920,28 @@ class AttnArgs:
     attn_scale: float
     key_offset: bool
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+def _select_flash_attn_interface():
+    backend = os.environ.get("ATTN_BACKEND", "auto").lower().replace("-", "_")
+    if backend in ("fa3", "kernels"):
+        return get_kernel("varunneal/flash-attention-3").flash_attn_interface
+    if backend in ("flash_attn", "fa"):
+        from flash_attn import flash_attn_interface
+        return flash_attn_interface
+    if backend != "auto":
+        raise ValueError(f"Unknown ATTN_BACKEND: {backend}")
+
+    gpu_name = torch.cuda.get_device_properties(0).name
+    if "H100" in gpu_name:
+        return get_kernel("varunneal/flash-attention-3").flash_attn_interface
+    try:
+        from flash_attn import flash_attn_interface
+    except Exception as exc:
+        raise RuntimeError(
+            "flash-attn is required for non-H100 GPUs; install it or set ATTN_BACKEND=fa3 on H100."
+        ) from exc
+    return flash_attn_interface
+
+flash_attn_interface = _select_flash_attn_interface()
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -1641,6 +1662,35 @@ class Hyperparameters:
 
 args = Hyperparameters()
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+def _env_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    value = os.environ.get(name)
+    if not value:
+        return default
+    return tuple(int(item.strip()) for item in value.split(",") if item.strip())
+
+def _apply_gpu_profile(profile: str | None) -> None:
+    if not profile:
+        return
+    key = profile.lower()
+    if key in ("5090", "rtx5090", "24gb", "consumer24gb"):
+        args.train_bs_schedule = (1 * 2048 * 8, 2 * 2048 * 8, 3 * 2048 * 8)
+        args.train_bs_extension = 3 * 2048 * 8
+        args.val_batch_size = 32768
+        return
+    raise ValueError(f"Unknown GPU_PROFILE: {profile}")
+
+_apply_gpu_profile(os.environ.get("GPU_PROFILE"))
+args.train_bs_schedule = _env_tuple("TRAIN_BS_SCHEDULE", args.train_bs_schedule)
+args.train_bs_extension = _env_int("TRAIN_BS_EXTENSION", args.train_bs_extension)
+args.train_max_seq_len = _env_int("TRAIN_MAX_SEQ_LEN", args.train_max_seq_len)
+args.val_batch_size = _env_int("VAL_BATCH_SIZE", args.val_batch_size)
+
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
 args.val_files = os.path.join(data_path, args.val_files)
@@ -1649,13 +1699,16 @@ args.val_files = os.path.join(data_path, args.val_files)
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
+grad_accum_steps = _env_int("GRAD_ACCUM_STEPS", 8 // world_size)
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
+max_tokens = max((args.val_batch_size, args.train_bs_extension, *args.train_bs_schedule))
+max_seq_len = max_tokens // (grad_accum_steps * world_size)
 
 # begin logging
 logfile = None
@@ -1691,7 +1744,7 @@ model: nn.Module = GPT(
     num_heads=8,
     head_dim=128,
     model_dim=1024,
-    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    max_seq_len=max_seq_len
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
